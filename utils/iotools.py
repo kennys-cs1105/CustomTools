@@ -50,14 +50,6 @@ def get_sitk_image_and_array(source):
     return image, array
 
 
-# 示例使用
-# image, array = get_array('/path/to/dicom/folder')
-# image, array = get_array('/path/to/file.nii')
-# image, array = get_array(sitk_image)
-# image, array = get_array(numpy_array)
-# image, array = get_array('/path/to/file.npy')
-
-
 def read_mask(mask_path):
     """
     从给定的文件路径读取掩码。
@@ -69,7 +61,11 @@ def read_mask(mask_path):
     np.ndarray: 读取的掩码数组。
     """
     if mask_path.endswith(".npy"):
-        return np.load(mask_path)
+        try:
+            return np.load(mask_path, allow_pickle=False)
+        except ValueError:
+            # 如果因对象数组加载失败，尝试使用 allow_pickle=True（需确保文件可信）
+            return np.load(mask_path, allow_pickle=True)
     else:
         return sitk.GetArrayFromImage(sitk.ReadImage(mask_path))
 

@@ -12,127 +12,6 @@ import nibabel as nib
 from skimage import filters
 
 from utils.iotools import load_mask, get_sitk_data, get_nib_data
-from libs.totalsegmentator.python_api import totalsegmentator
-
-
-LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
-
-
-def segment(
-        input_nifti_path: Union[str, Nifti1Image], 
-        task: str, 
-        output_path: str, 
-        **kwargs
-):
-    """
-    Using totalsegmentator method api
-
-    Args:
-
-    """
-    assert isinstance(input_nifti_path, (str, Nifti1Image)), "Input nifti path should be provided correctly."
-
-    if not os.path.exists(output_path):
-        logging.info(f"Starting {task} prediction for {input_nifti_path}")
-        totalsegmentator(input=input_nifti_path, output=output_path, task=task, **kwargs)
-        logging.info(f"{task} prediction finished and saved to {output_path}")
-
-
-def run_segmentation_task(task_name: str, task_callable: Callable[[], None], attempt: int = 1, retry_attempts: int = 2):
-    """
-    Run a single task with retries
-
-    Args:
-        task_name (str): Task names.
-        task_callable (Callabel): Callable functions corresponding to task names.
-        attempt (int): Number of times to retry.
-        retry_attempts (int): Number of times to retry a failed task before giving up.
-    """
-    try:
-        logging.info(f"[{task_name}] Attempt {attempt} started.")
-        start_time = time.time()
-        task_callable()
-        elapsed_time = time.time() - start_time
-        logging.info(f"[{task_name}] Completed successfully in {elapsed_time:.2f}s.")
-    except Exception as e:
-        logging.error(f"[{task_name}] Attempt {attempt} failed with error: {e}\n{traceback.format_exc()}")
-        if attempt < retry_attempts:
-            logging.info(f"[{task_name}] Retrying attempt {attempt + 1}/{retry_attempts}...")
-            run_segmentation_task(task_name, task_callable, attempt + 1)
-        else:
-            logging.critical(f"[{task_name}] Failed after {retry_attempts} attempts. Skipping.")
-    
-
-def execute_segmentation_tasks(task_group: Dict[str, Callable[[], None]], max_worker=None, timeout=None, retry_attempts=3):
-        """
-        Execute a group of tasks in parallel and log their status
-        
-        Args:
-            task_groups (Dict[str, Callable[[], None]]): A dict of task name and corresponding callable tasks
-            max_worker (int): Maximum number of parallel workers. Defaults to CPU count
-            timeout (int): Maximum time (in seconds) to wait for each task. Defaults to None.
-            retry_attempts (int): Number of retry attempts for failed tasks. Defaults to 3
-        """
-        if max_worker is None:
-            max_worker = min(4, os.cpu_count() or 1)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_worker) as executor:
-            future_to_task: Dict[concurrent.futures.Future, str] = {
-                executor.submit(run_segmentation_task, name, task): name for name, task in task_group.items()
-            }
-            for future in concurrent.futures.as_completed(future_to_task, timeout=timeout):
-                task_name = future_to_task[future]
-                try:
-                    future.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    logging.error(f"[{task_name}] Timed out after {timeout} seconds.")
-                except Exception as exc:
-                    logging.error(f"[{task_name}] Encountered an unexpected error: {exc}")
-
-
-def process_region_ct_file(
-        region_ct_file: str,
-        fine_chest_ct_dir: str,
-        fine_lobe_prediction_dir: str,
-        lobe_segmentation_function: Callable
-):
-    """
-    Processing region ct files of chest roi file for fine lobe segmentation
-    """
-    region_ct_path = os.path.join(fine_chest_ct_dir, region_ct_file)
-    basename = region_ct_file.split("_0000.nii.gz")[0]
-
-    output_path = os.path.join(fine_lobe_prediction_dir, f"{basename}.nii.gz")
-    lobe_segmentation_function(task="lobe", input_path=region_ct_path, lobe_output_path=output_path, ml=True, fast=True)
-
-    logging.info(f"Processed: {region_ct_file}")
-
-
-def infer_fine_lobe_parallel(
-        fine_chest_ct_dir: str,
-        fine_lobe_prediction_dir: str,
-        lobe_segmentation_function: Callable,
-        max_worker: int,
-):
-    """
-    Perform fine lobe segmentation in parallel
-    """
-    ct_files = [f for f in os.listdir(fine_chest_ct_dir) if f.endswith(".nii.gz")]
-
-    os.makedirs(fine_lobe_prediction_dir, exist_ok=True)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_worker) as executor:
-        futures = []
-        for region_ct_file in ct_files:
-            futures.append(
-                executor.submit(process_region_ct_file, region_ct_file, fine_chest_ct_dir, fine_lobe_prediction_dir, lobe_segmentation_function)
-            )
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception as exc:
-                logging.error(f"Exception occurred: {exc}")
 
 
 def merge_masks(
@@ -243,42 +122,6 @@ def merge_masks(
     return merged_mask_image
 
 
-def generate_task_lambda(task_name, input_nifti_path, output_path, ml=False, fast=False):
-    return lambda: (
-        segment(task=task_name, input_nifti_path=input_nifti_path, output_path=output_path, ml=ml, fast=fast)
-        if not os.path.exists(output_path)
-        else logging.info(f"{task_name.capitalize()} mask already exists. Skipping.")
-    )
-
-
-def assign_tasks_to_loops(task_list, paths_map, input_nifti_path):
-    loops = {}
-    loop_index = 1
-    current_group = {}
-
-    for i, task in enumerate(task_list):
-        task_name = task["name"]
-        ml = task.get("ml", False)
-        fast = task.get("fast", False)
-
-        if task_name not in paths_map:
-            logging.warning(f"Unknown task '{task_name}', skipping.")
-            continue
-
-        output_path = paths_map[task_name]
-        current_group[f"{task_name}_segmentation"] = generate_task_lambda(
-            task_name, input_nifti_path, output_path, ml, fast
-        )
-
-        # Flush group if full or last element
-        if len(current_group) == 2 or i == len(task_list) - 1:
-            loops[f"tasks_loop_{loop_index}"] = current_group
-            loop_index += 1
-            current_group = {}
-
-    return loops
-
-
 def get_target_region(ct_file: Union[str, Nifti1Image], 
                       mask_file: Union[str, Nifti1Image], 
                       mapping: Dict, 
@@ -315,3 +158,41 @@ def get_target_region(ct_file: Union[str, Nifti1Image],
         organ_path = os.path.join(output_dir, f"{organ_name}.nii.gz")
         nib.save(organ_region_nii, organ_path)
         logging.info(f"{organ_name} region saved...")
+
+
+def read_labels(file_path):
+    """
+    读取nii.gz, 获取标签id
+
+    input: path to nii.gz
+
+    return: label id list -> [0,1,2,3,4]
+    """
+    image = sitk.ReadImage(file_path)
+    image_array = sitk.GetArrayFromImage(image)
+    unique_labels = set(image_array.flatten())
+
+    return unique_labels
+
+
+def extract_and_save_labels(input_file_path, label_id, output_path=None):
+    """
+    多标签nii.gz中的标签单独保存
+
+    input_file_path: path to multi-label nii.gz file
+    output_path: path to saved single-label nii.gz file
+    label_id: label id
+    """
+
+    image = sitk.ReadImage(input_file_path)
+    image_array = sitk.GetArrayFromImage(image)
+
+    label_array = np.zeros_like(image_array)
+    label_array[image_array == label_id] = 1
+    label_image = sitk.GetImageFromArray(label_array)     
+    label_image.CopyInformation(image)
+
+    if output_path is not None:
+        sitk.WriteImage(label_image, output_path)
+    else:
+        return label_image
